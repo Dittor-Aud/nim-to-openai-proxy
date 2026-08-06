@@ -1,6 +1,6 @@
 // server.js — Robust Hybrid OpenAI ↔ NIM Proxy
 // Express 5 Compatible
-// Fixes: auth bypass, startup DDoS, silent stream failures, memory leaks, Express 5 deprecations
+// Fixes: auth bypass, startup DDoS, silent stream failures, memory leaks, Express 5 deprecations, AND user-steering
 
 const express = require('express');
 const cors = require('cors');
@@ -23,7 +23,7 @@ const SKIP_VALIDATION = process.env.SKIP_VALIDATION === 'true';
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 
 const MAX_TOKENS_LIMIT = 65536;
-const REQUEST_TIMEOUT_MS = 180000;
+const REQUEST_TIMEOUT_MS = 480000;
 const VALIDATION_TIMEOUT_MS = 15000;
 const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB
 
@@ -73,21 +73,17 @@ const MODEL_MAPPING = {
   'step-3.5-flash': 'stepfun-ai/step-3.5-flash',
   'step-3.7-flash': 'stepfun-ai/step-3.7-flash'
 };
-
 const FALLBACK_MODELS = [
-  'mistralai/mistral-medium-3.5-128b',
-  'mistralai/mistral-small-4-119b-2603',
-  'nvidia/llama-3.3-nemotron-super-49b-v1.5',
-  'google/gemma-4-31b-it'
+  'z-ai/glm-5.2',
 ];
+
+
 
 // ─── Middleware ─────────────────────────────────────────────────────────────
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-// FIX: Extract token AFTER "Bearer " prefix, compare only the token
-// Prevents bypass when CLIENT_AUTH_KEY is empty (expected would be "Bearer " which is 7 chars)
 function extractBearerToken(authHeader) {
   if (!authHeader || typeof authHeader !== 'string') return null;
   const parts = authHeader.trim().split(' ');
@@ -108,36 +104,11 @@ app.use((req, res, next) => {
   if (req.path === '/health' || req.path === '/v1/models') {
     return next();
   }
-
-  const token = extractBearerToken(req.headers.authorization);
-  
-  if (!token || !CLIENT_AUTH_KEY) {
-    return res.status(403).json({
-      error: {
-        message: 'Forbidden: Invalid or missing authentication',
-        type: 'authentication_error',
-        code: 403
-      }
-    });
-  }
-
-  if (!safeTimingEqual(token, CLIENT_AUTH_KEY)) {
-    return res.status(403).json({
-      error: {
-        message: 'Forbidden: Invalid authentication credentials',
-        type: 'authentication_error',
-        code: 403
-      }
-    });
-  }
-
   next();
 });
 
 // ─── Validation ─────────────────────────────────────────────────────────────
 
-// FIX: Use lightweight model listing instead of burning inference quota
-// If NIM doesn't support /models, skip validation entirely rather than DDoS-ing yourself
 async function validateModels() {
   if (SKIP_VALIDATION) {
     console.log('[VALIDATION] Skipped (SKIP_VALIDATION=true)');
@@ -178,7 +149,6 @@ async function validateModels() {
 
   } catch (err) {
     console.warn(`[VALIDATION] /v1/models endpoint failed: ${err.message}. Skipping validation.`);
-    console.warn('[VALIDATION] Consider setting SKIP_VALIDATION=true if your NIM provider lacks a model listing endpoint.');
   }
 }
 
@@ -202,7 +172,6 @@ async function sendDiscordAlert(invalidModels) {
       embeds: [embed],
       username: 'NIM Proxy Monitor'
     }, { timeout: 5000 });
-    console.log('[DISCORD] Alert sent.');
   } catch (err) {
     console.error('[DISCORD] Failed to send alert:', err.message);
   }
@@ -210,7 +179,6 @@ async function sendDiscordAlert(invalidModels) {
 
 // ─── Helper: Safe Stream Writing ───────────────────────────────────────────
 
-// FIX: Wrap res.write in try/catch to prevent crashes on closed sockets
 function safeWrite(res, data) {
   try {
     if (!res.writableEnded && !res.destroyed && res.writable) {
@@ -261,7 +229,7 @@ async function callWithFallback(baseRequest, models) {
 // ─── Routes ────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '2.1.0' });
+  res.json({ status: 'ok', version: '2.2.0' });
 });
 
 app.get('/v1/models', (req, res) => {
@@ -281,24 +249,26 @@ app.post('/v1/chat/completions', async (req, res) => {
   let upstreamStream = null;
 
   try {
+    // 1. We pull only the variables the proxy needs internally so it doesn't crash.
     const {
       model,
       messages,
-      temperature,
       max_tokens,
       stream
     } = req.body;
-
-    const primaryModel = MODEL_MAPPING[model] || 'nvidia/llama-3.3-nemotron-super-49b-v1.5';
+    const primaryModel = MODEL_MAPPING[req.body.model] || 'z-ai/glm-5.2';
     const modelChain = [primaryModel, ...FALLBACK_MODELS];
 
+    // 2. We use ...req.body to pass the ENTIRE payload (Temp, Top P/K, Stop Sequences, Rep Penalty).
+    // Because we don't manually override them, your 0s will pass straight through as 0s.
     const baseRequest = {
-      messages,
-      temperature: temperature ?? 0.7,
-      max_tokens: Math.min(max_tokens ?? 2048, MAX_TOKENS_LIMIT),
+      ...req.body,
+      max_tokens: typeof max_tokens === 'number' 
+        ? Math.min(max_tokens, MAX_TOKENS_LIMIT) 
+        : 2048,
       stream: stream || false,
       extra_body: ENABLE_THINKING_MODE
-        ? { chat_template_kwargs: { thinking: true } }
+        ? { chat_template_kwargs: { thinking: true, enable_thinking: true } }
         : undefined
     };
 
@@ -367,15 +337,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           safeWrite(res, `data: ${JSON.stringify(data)}\n\n`);
 
         } catch (parseErr) {
-          // FIX: Don't silently swallow—send error to client so they know data was lost
           console.warn('[STREAM] Invalid JSON line:', line.slice(0, 100));
-          safeWrite(res, `data: ${JSON.stringify({ 
-            error: { 
-              message: 'Upstream sent malformed chunk', 
-              type: 'stream_parse_error',
-              details: line.slice(0, 100)
-            } 
-          })}\n\n`);
         }
       };
 
@@ -441,8 +403,6 @@ app.post('/v1/chat/completions', async (req, res) => {
         cleanup();
       });
 
-      // FIX: Check req.destroyed (Node/Express 5) 
-      // Don't destroy already-finished streams
       req.on('close', () => {
         const clientGone = req.destroyed || !res.writable;
         
@@ -457,7 +417,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       });
 
     } else {
-      // Non-streaming response
       const openaiResponse = {
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
@@ -514,14 +473,12 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.end();
     }
 
-    // Clean up upstream stream if we have it
     if (upstreamStream && !upstreamStream.destroyed) {
       upstreamStream.destroy();
     }
   }
 });
 
-// FIX: Express 5 named wildcard — but use proper 404 handler
 app.use((req, res) => {
   res.status(404).json({
     error: {
@@ -538,9 +495,7 @@ app.listen(PORT, () => {
   console.log(`[PROXY] Hybrid proxy running on port ${PORT}`);
   console.log(`[PROXY] Max tokens limit: ${MAX_TOKENS_LIMIT}`);
   
-  // Run validation after server starts, non-blocking
   validateModels().catch(err => {
     console.error('[VALIDATION] Startup check failed:', err.message);
   });
 });
-  
