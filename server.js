@@ -74,7 +74,7 @@ const MODEL_MAPPING = {
   'step-3.7-flash': 'stepfun-ai/step-3.7-flash'
 };
 const FALLBACK_MODELS = [
-  'z-ai/glm-5.2',
+  'moonshotai/kimi-k2.6',
 ];
 
 
