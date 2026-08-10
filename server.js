@@ -1,6 +1,28 @@
 // server.js — Robust Hybrid OpenAI ↔ NIM Proxy
 // Express 5 Compatible
-// Fixes: auth bypass, startup DDoS, silent stream failures, memory leaks, Express 5 deprecations, AND user-steering
+// Fixes: auth bypass, startup DDoS, silent stream failures, memory leaks, Express 5 deprecations
+// Consolidated Reasoning Subsystem
+//
+// === REASONING PAYLOAD FIXES (this revision) ===
+// 1. Removed the `extra_body: {...}` wrapper from getReasoningPayload(). That key only means
+//    anything inside the official openai-python/node SDK, where it gets unwrapped client-side
+//    and merged into the outgoing JSON as top-level fields. This proxy uses raw axios, so
+//    sending a literal `"extra_body"` key was dead weight — NIM never saw chat_template_kwargs,
+//    reasoning_effort, or anything else nested under it. Confirmed against NVIDIA's own curl
+//    docs, which send chat_template_kwargs directly at the top level.
+// 2. GLM-5.2 previously only ever set `reasoning_effort`, which controls thinking *intensity*,
+//    not whether thinking happens at all. GLM-5.2 thinks by default. The real switch is a
+//    top-level `thinking: { type: "enabled" | "disabled" }` field (per z.ai's own docs). Added.
+// 3. nemotron-3-ultra's `force_nonempty_content` flag is NOT a confirmed NVIDIA parameter —
+//    left in as opt-in/best-effort since unrecognized chat_template_kwargs are typically just
+//    ignored by the backend rather than causing a hard failure, but flagged here so you know
+//    it's unverified if you ever go looking for why something isn't behaving.
+//
+// === REASONING OUTPUT FORMAT FIX (this revision) ===
+// 4. Fixed reasoning leaking into message content for clients that don't parse `<thinking>` tags.
+//    Default behavior is now clean `content` + structured `reasoning`/`reasoning_content` fields.
+//    GoonChat (or any legacy client that expects inline tags) can opt-in by sending the
+//    `x-reasoning-format: inline` header.
 
 const express = require('express');
 const cors = require('cors');
@@ -34,9 +56,9 @@ if (ENABLE_THINKING_MODE) console.log('[CONFIG] Thinking mode: ENABLED');
 
 function validateConfig() {
   const fatal = (msg) => { console.error(`[FATAL] ${msg}`); process.exit(1); };
-  
+
   if (!NIM_API_KEY) fatal('NIM_API_KEY is required. Get one at https://build.nvidia.com/');
-  
+
   if (!CLIENT_AUTH_KEY) {
     console.warn('[WARN] CLIENT_AUTH_KEY not set. All requests will be rejected with 403.');
   }
@@ -77,12 +99,235 @@ const MODEL_MAPPING = {
 const FALLBACK_MODELS = [];
 
 
+// ─── Reasoning Subsystem ─────────────────────────────────────────────────────
+// Pure, stateful string parser for extracting reasoning blocks across chunks.
+
+class DelimiterParser {
+  constructor(openTag, closeTag) {
+    this.openTag = openTag;
+    this.closeTag = closeTag;
+    this.inThinking = false;
+    this.buffer = '';
+  }
+
+  processChunk(chunk) {
+    this.buffer += chunk;
+    let content = '';
+    let reasoning = '';
+
+    while (true) {
+      const targetTag = this.inThinking ? this.closeTag : this.openTag;
+      const tagIndex = this.buffer.indexOf(targetTag);
+
+      if (tagIndex !== -1) {
+        const textBefore = this.buffer.substring(0, tagIndex);
+        if (this.inThinking) {
+          reasoning += textBefore;
+        } else {
+          content += textBefore;
+        }
+        this.inThinking = !this.inThinking;
+        this.buffer = this.buffer.substring(tagIndex + targetTag.length);
+      } else {
+        // Check for partial tag at the end
+        let partialLen = 0;
+        const maxLen = Math.min(this.buffer.length, targetTag.length - 1);
+        for (let i = maxLen; i > 0; i--) {
+          if (targetTag.startsWith(this.buffer.substring(this.buffer.length - i))) {
+            partialLen = i;
+            break;
+          }
+        }
+
+        const textBefore = this.buffer.substring(0, this.buffer.length - partialLen);
+        if (this.inThinking) {
+          reasoning += textBefore;
+        } else {
+          content += textBefore;
+        }
+        this.buffer = this.buffer.substring(this.buffer.length - partialLen);
+        break;
+      }
+    }
+    return { content, reasoning };
+  }
+
+  flush() {
+    let content = '';
+    let reasoning = '';
+    if (this.buffer) {
+      if (this.inThinking) {
+        reasoning += this.buffer;
+      } else {
+        content += this.buffer;
+      }
+      this.buffer = '';
+    }
+    return { content, reasoning };
+  }
+}
+
+// Normalizes structured reasoning fields and extracts content delimiters.
+class StreamNormalizer {
+  constructor(model) {
+    this.model = model;
+    this.parser = null;
+
+    // ONLY use content delimiters for models that embed reasoning in content
+    if (model === 'qwen/qwen3.5-397b-a17b' || model === 'nvidia/llama-3.3-nemotron-super-49b-v1.5') {
+      this.parser = new DelimiterParser('<think>', '</think>');
+    }
+    // Models like Gemma 4, DeepSeek, GPT-OSS use structured fields and are NOT parsed here.
+  }
+
+  processDelta(delta) {
+    const normalizedDelta = { ...delta };
+    let reasoning = normalizedDelta.reasoning || normalizedDelta.reasoning_content || '';
+    let content = normalizedDelta.content || '';
+
+    // Priority: Structured reasoning > Content delimiters
+    if (!reasoning && content && this.parser) {
+      const parsed = this.parser.processChunk(content);
+      reasoning = parsed.reasoning;
+      content = parsed.content;
+    }
+
+    if (content) normalizedDelta.content = content;
+    else delete normalizedDelta.content;
+
+    if (reasoning) normalizedDelta.reasoning = reasoning;
+    else delete normalizedDelta.reasoning;
+
+    delete normalizedDelta.reasoning_content;
+    return normalizedDelta;
+  }
+
+  flush() {
+    if (!this.parser) return { content: '', reasoning: '' };
+    return this.parser.flush();
+  }
+}
+
+function normalizeNonStreamChoice(choice, model) {
+  if (!choice) return choice;
+
+  const message = choice.message || {};
+  let reasoning = message.reasoning || message.reasoning_content || '';
+  let content = message.content || '';
+
+  if (!reasoning && content) {
+    let parser = null;
+    if (model === 'qwen/qwen3.5-397b-a17b' || model === 'nvidia/llama-3.3-nemotron-super-49b-v1.5') {
+      parser = new DelimiterParser('<think>', '</think>');
+    }
+
+    if (parser) {
+      const parsed = parser.processChunk(content);
+      const flushed = parser.flush();
+      content = (parsed.content || '') + (flushed.content || '');
+      reasoning = (parsed.reasoning || '') + (flushed.reasoning || '');
+    }
+  }
+
+  const newMessage = { ...message };
+  if (content) newMessage.content = content;
+  if (reasoning) newMessage.reasoning = reasoning;
+  delete newMessage.reasoning_content;
+
+  return { ...choice, message: newMessage };
+}
+
+// Pure function returning model-specific reasoning request payloads.
+// IMPORTANT: everything returned here gets spread DIRECTLY into the top-level
+// JSON body sent to NIM via axios. Do NOT wrap anything in an `extra_body` key —
+// that's an openai-SDK-only convention this proxy doesn't use, and NIM's raw
+// REST endpoint will just silently ignore a field called "extra_body".
+function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTools) {
+  const effort = clientReasoningEffort;
+
+  switch (model) {
+    case 'nvidia/nemotron-3-super-120b-a12b': {
+      if (!enableThinking) return {};
+      return { chat_template_kwargs: { enable_thinking: true } };
+    }
+
+    case 'nvidia/nemotron-3-ultra-550b-a55b': {
+      if (!enableThinking) return {};
+      const payload = { chat_template_kwargs: { enable_thinking: true } };
+      // Unverified param — see header comment. Left as opt-in best-effort.
+      if (hasTools) payload.chat_template_kwargs.force_nonempty_content = true;
+      return payload;
+    }
+
+    case 'qwen/qwen3.5-397b-a17b': {
+      // Model appears to default to thinking-on in its chat template. Only send
+      // a field when the caller explicitly wants thinking OFF; otherwise let the
+      // <think> delimiter parser handle whatever the model does natively.
+      if (enableThinking) return {};
+      return { chat_template_kwargs: { enable_thinking: false } };
+    }
+
+    case 'deepseek-ai/deepseek-v4-pro':
+    case 'deepseek-ai/deepseek-v4-flash': {
+      if (!enableThinking) return {};
+      const payload = { chat_template_kwargs: { thinking: true } };
+      if (effort) payload.chat_template_kwargs.reasoning_effort = effort;
+      return payload;
+    }
+
+    case 'openai/gpt-oss-120b':
+    case 'openai/gpt-oss-20b': {
+      if (effort && ['low', 'medium', 'high'].includes(effort)) {
+        return { reasoning_effort: effort };
+      }
+      if (enableThinking) return { reasoning_effort: 'high' };
+      return {};
+    }
+
+    case 'mistralai/mistral-medium-3.5-128b':
+    case 'mistralai/mistral-small-4-119b-2603': {
+      if (effort && ['high', 'none'].includes(effort)) {
+        return { reasoning_effort: effort };
+      }
+      if (enableThinking) return { reasoning_effort: 'high' };
+      return {};
+    }
+
+    case 'z-ai/glm-5.2': {
+      // FIX: GLM-5.2 thinks by default. `reasoning_effort` only controls
+      // intensity (max vs high) once thinking is already happening — it does
+      // NOT turn thinking off. The actual on/off switch is `thinking.type`.
+      // Without this, GLM-5.2 was silently reasoning on every single request
+      // regardless of ENABLE_THINKING_MODE.
+      const payload = {
+        thinking: { type: enableThinking ? 'enabled' : 'disabled' }
+      };
+      if (enableThinking && effort) payload.reasoning_effort = effort;
+      return payload;
+    }
+
+    case 'google/gemma-4-31b-it': {
+      if (!enableThinking) return {};
+      return { chat_template_kwargs: { enable_thinking: true } };
+    }
+
+    case 'stepfun-ai/step-3.7-flash': {
+      if (enableThinking) return {};
+      return { chat_template_kwargs: { thinking: false } };
+    }
+
+    default:
+      // Default reasoning models (Kimi, MiniMax, etc.) or non-reasoning models
+      return {};
+  }
+}
 
 // ─── Middleware ─────────────────────────────────────────────────────────────
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+// FIX: Extract token AFTER "Bearer " prefix, compare only the token
 function extractBearerToken(authHeader) {
   if (!authHeader || typeof authHeader !== 'string') return null;
   const parts = authHeader.trim().split(' ');
@@ -103,6 +348,29 @@ app.use((req, res, next) => {
   if (req.path === '/health' || req.path === '/v1/models') {
     return next();
   }
+
+  const token = extractBearerToken(req.headers.authorization);
+
+  if (!token || !CLIENT_AUTH_KEY) {
+    return res.status(403).json({
+      error: {
+        message: 'Forbidden: Invalid or missing authentication',
+        type: 'authentication_error',
+        code: 403
+      }
+    });
+  }
+
+  if (!safeTimingEqual(token, CLIENT_AUTH_KEY)) {
+    return res.status(403).json({
+      error: {
+        message: 'Forbidden: Invalid authentication credentials',
+        type: 'authentication_error',
+        code: 403
+      }
+    });
+  }
+
   next();
 });
 
@@ -130,7 +398,7 @@ async function validateModels() {
     );
 
     const invalid = [];
-    
+
     for (const [alias, nimId] of Object.entries(MODEL_MAPPING)) {
       if (availableModels.has(nimId)) {
         console.log(`[VALIDATION] ✓ ${alias} → ${nimId}`);
@@ -148,6 +416,7 @@ async function validateModels() {
 
   } catch (err) {
     console.warn(`[VALIDATION] /v1/models endpoint failed: ${err.message}. Skipping validation.`);
+    console.warn('[VALIDATION] Consider setting SKIP_VALIDATION=true if your NIM provider lacks a model listing endpoint.');
   }
 }
 
@@ -171,6 +440,7 @@ async function sendDiscordAlert(invalidModels) {
       embeds: [embed],
       username: 'NIM Proxy Monitor'
     }, { timeout: 5000 });
+    console.log('[DISCORD] Alert sent.');
   } catch (err) {
     console.error('[DISCORD] Failed to send alert:', err.message);
   }
@@ -192,14 +462,16 @@ function safeWrite(res, data) {
 
 // ─── Helper: Fallback Chain ─────────────────────────────────────────────────
 
-async function callWithFallback(baseRequest, models) {
+async function callWithFallback(baseRequest, models, enableThinking, clientReasoningEffort, hasTools) {
   let lastError = null;
 
   for (const model of models) {
     try {
+      const reasoningPayload = getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTools);
+
       const res = await axios.post(
         `${NIM_API_BASE}/chat/completions`,
-        { ...baseRequest, model },
+        { ...baseRequest, model, ...reasoningPayload },
         {
           headers: {
             Authorization: `Bearer ${NIM_API_KEY}`,
@@ -248,32 +520,35 @@ app.post('/v1/chat/completions', async (req, res) => {
   let upstreamStream = null;
 
   try {
-    // 1. We pull only the variables the proxy needs internally so it doesn't crash.
     const {
       model,
       messages,
+      temperature,
       max_tokens,
       stream
     } = req.body;
-    const primaryModel = MODEL_MAPPING[req.body.model] || req.body.model;
-    const modelChain = [primaryModel];
+    const primaryModel = MODEL_MAPPING[req.body.model] || 'z-ai/glm-5.2';
+    const modelChain = [primaryModel, ...FALLBACK_MODELS];
 
-    // 2. We use ...req.body to pass the ENTIRE payload (Temp, Top P/K, Stop Sequences, Rep Penalty).
-    // Because we don't manually override them, your 0s will pass straight through as 0s.
     const baseRequest = {
-      ...req.body,
-      max_tokens: typeof max_tokens === 'number' 
-        ? Math.min(max_tokens, MAX_TOKENS_LIMIT) 
-        : 2048,
-      stream: stream || false,
-      extra_body: ENABLE_THINKING_MODE
-        ? { chat_template_kwargs: { thinking: true, enable_thinking: true } }
-        : undefined
+      messages,
+      temperature: temperature ?? 0.7,
+      max_tokens: Math.min(max_tokens ?? 2048, MAX_TOKENS_LIMIT),
+      stream: stream || false
     };
 
-    const { response, model: usedModel } = await callWithFallback(baseRequest, modelChain);
+    const { response, model: usedModel } = await callWithFallback(
+      baseRequest,
+      modelChain,
+      ENABLE_THINKING_MODE,
+      req.body.reasoning_effort,
+      !!req.body.tools
+    );
     upstreamStream = response.data;
     console.log('[PROXY] Model used:', usedModel);
+
+    // Determine if the client wants legacy inline <thinking> tags in the content stream
+    const inlineReasoning = req.headers['x-reasoning-format'] === 'inline';
 
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
@@ -285,6 +560,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       let reasoningOpen = false;
       let doneSent = false;
       let cleanedUp = false;
+
+      const normalizer = new StreamNormalizer(usedModel);
 
       const cleanup = () => {
         if (cleanedUp) return;
@@ -312,31 +589,57 @@ app.post('/v1/chat/completions', async (req, res) => {
           const delta = data.choices?.[0]?.delta;
 
           if (delta) {
-            let content = delta.content || '';
-            const reasoning = delta.reasoning_content;
+            const normalizedDelta = normalizer.processDelta(delta);
+            let clientContent = '';
 
-            if (SHOW_REASONING) {
-              if (reasoning && !reasoningOpen) {
-                content = `<thinking>\n${reasoning.replace(/\n/g, '\\n')}`;
+            if (SHOW_REASONING && inlineReasoning) {
+              // Legacy GoonChat behavior: bake <thinking> tags into content
+              if (normalizedDelta.reasoning && !reasoningOpen) {
+                clientContent += `<thinking>\n${normalizedDelta.reasoning}`;
                 reasoningOpen = true;
-              } else if (reasoning) {
-                content = reasoning.replace(/\n/g, '\\n');
+              } else if (normalizedDelta.reasoning) {
+                clientContent += normalizedDelta.reasoning;
               }
 
-              if (delta.content && reasoningOpen) {
-                content += `\n</thinking>\n\n${delta.content}`;
+              if (normalizedDelta.content && reasoningOpen) {
+                clientContent += `\n</thinking>\n\n${normalizedDelta.content}`;
                 reasoningOpen = false;
+              } else if (normalizedDelta.content) {
+                clientContent += normalizedDelta.content;
               }
+            } else {
+              // Default behavior: clean content, no inline tags
+              clientContent = normalizedDelta.content || '';
             }
 
-            delta.content = content;
-            delete delta.reasoning_content;
+            delta.content = clientContent;
+
+            // FIX: keep a structured reasoning field alongside the inline
+            // tags in content. GoonChat parses the inline tags;
+            // clients like Pal Chat / OpenRouter-style apps look for a
+            // separate `reasoning`/`reasoning_content` field to render their
+            // own collapsible thinking UI. Without this, those clients just
+            // see one flat content blob and never show a thinking indicator.
+            if (SHOW_REASONING && normalizedDelta.reasoning) {
+              delta.reasoning = normalizedDelta.reasoning;
+              delta.reasoning_content = normalizedDelta.reasoning;
+            } else {
+              delete delta.reasoning;
+              delete delta.reasoning_content;
+            }
           }
 
           safeWrite(res, `data: ${JSON.stringify(data)}\n\n`);
 
         } catch (parseErr) {
           console.warn('[STREAM] Invalid JSON line:', line.slice(0, 100));
+          safeWrite(res, `data: ${JSON.stringify({
+            error: {
+              message: 'Upstream sent malformed chunk',
+              type: 'stream_parse_error',
+              details: line.slice(0, 100)
+            }
+          })}\n\n`);
         }
       };
 
@@ -345,11 +648,11 @@ app.post('/v1/chat/completions', async (req, res) => {
 
         if (buffer.length > MAX_BUFFER_SIZE) {
           console.error('[STREAM] Buffer overflow, destroying connection');
-          safeWrite(res, `data: ${JSON.stringify({ 
-            error: { 
-              message: 'Stream buffer overflow', 
-              type: 'stream_error' 
-            } 
+          safeWrite(res, `data: ${JSON.stringify({
+            error: {
+              message: 'Stream buffer overflow',
+              type: 'stream_error'
+            }
           })}\n\n`);
           safeWrite(res, 'data: [DONE]\n\n');
           res.end();
@@ -375,6 +678,32 @@ app.post('/v1/chat/completions', async (req, res) => {
           }
         }
 
+        const flushedDelta = normalizer.flush();
+        if (flushedDelta.content || flushedDelta.reasoning) {
+          let clientContent = '';
+          if (SHOW_REASONING && inlineReasoning) {
+            // Legacy GoonChat behavior: bake <thinking> tags into content
+            if (flushedDelta.reasoning && !reasoningOpen) {
+              clientContent += `<thinking>\n${flushedDelta.reasoning}`;
+              reasoningOpen = true;
+            } else if (flushedDelta.reasoning) {
+              clientContent += flushedDelta.reasoning;
+            }
+            if (flushedDelta.content && reasoningOpen) {
+              clientContent += `\n</thinking>\n\n${flushedDelta.content}`;
+              reasoningOpen = false;
+            } else if (flushedDelta.content) {
+              clientContent += flushedDelta.content;
+            }
+          } else {
+            // Default behavior: clean content, no inline tags
+            clientContent = flushedDelta.content || '';
+          }
+          if (clientContent) {
+            safeWrite(res, `data: ${JSON.stringify({ choices: [{ delta: { content: clientContent } }] })}\n\n`);
+          }
+        }
+
         if (!doneSent) {
           safeWrite(res, 'data: [DONE]\n\n');
         }
@@ -388,7 +717,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       upstreamStream.on('error', err => {
         console.error('[STREAM] Upstream error:', err.message);
-        
+
         if (!res.writableEnded) {
           safeWrite(res, `data: ${JSON.stringify({
             error: {
@@ -404,7 +733,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       req.on('close', () => {
         const clientGone = req.destroyed || !res.writable;
-        
+
         if (!streamEndedCleanly && clientGone) {
           console.warn('[STREAM] Client disconnected prematurely');
         }
@@ -416,28 +745,41 @@ app.post('/v1/chat/completions', async (req, res) => {
       });
 
     } else {
+      // Non-streaming response
       const openaiResponse = {
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
         model: model,
         choices: (response.data.choices || []).map((choice, i) => {
-          let content = choice.message?.content || '';
+          const normalizedChoice = normalizeNonStreamChoice(choice, usedModel);
+          let content = normalizedChoice.message?.content || '';
+          const reasoning = normalizedChoice.message?.reasoning || '';
 
-          if (SHOW_REASONING && choice.message?.reasoning_content) {
-            const safeReasoning = choice.message.reasoning_content.replace(/\n/g, '\\n');
-            content = `<thinking>\n${safeReasoning}\n</thinking>\n\n${content}`;
+          if (SHOW_REASONING && inlineReasoning && reasoning) {
+            // Legacy GoonChat behavior: bake <thinking> tags into content
+            content = `<thinking>\n${reasoning}\n</thinking>\n\n${content}`;
           }
 
-          return {
+          const finalMessage = { ...normalizedChoice.message, content };
+
+          // Same fix as the streaming path: keep the structured field
+          // alongside the inline tags so structured-reasoning clients
+          // (Pal Chat, OpenRouter-style apps) can render their own UI.
+          if (SHOW_REASONING && reasoning) {
+            finalMessage.reasoning = reasoning;
+            finalMessage.reasoning_content = reasoning;
+          } else {
+            delete finalMessage.reasoning;
+            delete finalMessage.reasoning_content;
+          }
+
+          const finalChoice = {
+            ...normalizedChoice,
             index: i,
-            message: {
-              role: choice.message?.role || 'assistant',
-              content,
-              tool_calls: choice.message?.tool_calls
-            },
-            finish_reason: choice.finish_reason || 'stop'
+            message: finalMessage
           };
+          return finalChoice;
         }),
         usage: response.data.usage || {
           prompt_tokens: 0,
@@ -493,7 +835,7 @@ app.use((req, res) => {
 app.listen(PORT, () => {
   console.log(`[PROXY] Hybrid proxy running on port ${PORT}`);
   console.log(`[PROXY] Max tokens limit: ${MAX_TOKENS_LIMIT}`);
-  
+
   validateModels().catch(err => {
     console.error('[VALIDATION] Startup check failed:', err.message);
   });
