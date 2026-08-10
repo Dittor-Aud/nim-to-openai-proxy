@@ -523,16 +523,14 @@ app.post('/v1/chat/completions', async (req, res) => {
     const {
       model,
       messages,
-      temperature,
       max_tokens,
       stream
     } = req.body;
-    const primaryModel = MODEL_MAPPING[req.body.model] || 'z-ai/glm-5.2';
-    const modelChain = [primaryModel, ...FALLBACK_MODELS];
+    const primaryModel = MODEL_MAPPING[req.body.model] || 'req.body.model';
+    const modelChain = [primaryModel];
 
     const baseRequest = {
       messages,
-      temperature: temperature ?? 0.7,
       max_tokens: Math.min(max_tokens ?? 2048, MAX_TOKENS_LIMIT),
       stream: stream || false
     };
