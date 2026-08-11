@@ -526,7 +526,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       max_tokens,
       stream
     } = req.body;
-    const primaryModel = MODEL_MAPPING[req.body.model] || 'req.body.model';
+    const primaryModel = MODEL_MAPPING[req.body.model] || req.body.model;
     const modelChain = [primaryModel];
 
     const baseRequest = {
