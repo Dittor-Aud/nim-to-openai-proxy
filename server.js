@@ -486,7 +486,7 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
 
     } catch (err) {
       lastError = err;
-      console.error('[PROXY] RAW ERROR:', error);
+      console.error('[PROXY] NIM response:', error.response?.data);
     }
   }
 
