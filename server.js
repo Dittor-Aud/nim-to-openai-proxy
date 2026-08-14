@@ -486,11 +486,15 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
 
     } catch (err) {
       lastError = err;
-      console.warn(
-        `[FALLBACK] Model failed: ${model}`,
-        err.response?.status,
-        err.response?.data?.error?.message || err.message
-      );
+      console.warn('[NVIDIA] Request failed:', {
+  model,
+  status: err.response?.status,
+  data: err.response?.data,
+  retryAfter: err.response?.headers?.['retry-after'],
+  rateLimit: err.response?.headers?.['x-ratelimit-limit'],
+  remaining: err.response?.headers?.['x-ratelimit-remaining'],
+  reset: err.response?.headers?.['x-ratelimit-reset']
+});
     }
   }
 
@@ -523,6 +527,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     const {
       model,
       messages,
+      temperature,
+      top_p,
       max_tokens,
       stream
     } = req.body;
@@ -531,6 +537,8 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     const baseRequest = {
       messages,
+      temperature: temperature ?? 0.7,
+      top_p: top_p ?? 0.85,
       max_tokens: Math.min(max_tokens ?? 2048, MAX_TOKENS_LIMIT),
       stream: stream || false
     };
