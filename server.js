@@ -486,14 +486,13 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
 
     } catch (err) {
       lastError = err;
-      console.warn('[NVIDIA] Request failed:', {
-  model,
-  status: err.response?.status,
-  data: err.response?.data,
-  retryAfter: err.response?.headers?.['retry-after'],
-  rateLimit: err.response?.headers?.['x-ratelimit-limit'],
-  remaining: err.response?.headers?.['x-ratelimit-remaining'],
-  reset: err.response?.headers?.['x-ratelimit-reset']
+      console.error('[PROXY] ERROR:', {
+  message: error.message,
+  code: error.code,
+  status: error.response?.status,
+  data: error.response?.data,
+  headers: error.response?.headers,
+  request: error.request ? 'exists' : 'none'
 });
     }
   }
