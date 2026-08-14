@@ -486,14 +486,7 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
 
     } catch (err) {
       lastError = err;
-      console.error('[PROXY] ERROR:', {
-  message: error.message,
-  code: error.code,
-  status: error.response?.status,
-  data: error.response?.data,
-  headers: error.response?.headers,
-  request: error.request ? 'exists' : 'none'
-});
+      console.error('[PROXY] RAW ERROR:', error);
     }
   }
 
